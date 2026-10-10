@@ -65,6 +65,20 @@ Screen {
     text-style: bold;
 }
 
+/* Plain-language meaning of the decoded text, under the receive window. */
+#meaning-frame {
+    height: 9;
+    border: round $primary-darken-2;
+    border-title-color: $accent;
+    border-title-align: left;
+}
+
+#meaning {
+    height: 1fr;
+    padding: 0 1;
+    background: $surface;
+}
+
 /* Three lines of detail inside the frame. */
 #detail {
     height: 5;
@@ -103,4 +117,113 @@ Screen {
     height: 1;
     background: $panel;
     padding: 0 1;
+}
+
+/* ----------------------------------------------------------- panels ---- */
+
+/* Dialogs, framed like the windows (as in HAMRLOG). */
+ModalScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+.modal {
+    width: 84;
+    height: auto;
+    padding: 0 1;
+    background: $surface;
+    border: round $accent;
+    border-title-color: $accent;
+    border-title-style: bold;
+    border-title-align: left;
+}
+
+.modal-subtitle {
+    width: 100%;
+    color: $text;
+    padding: 1 0;
+}
+
+.modal-help {
+    width: 100%;
+    color: $text-muted;
+    text-style: italic;
+    padding-top: 1;
+}
+
+.modal-buttons {
+    height: auto;
+    width: 100%;
+    align-horizontal: right;
+    padding-top: 1;
+}
+
+.modal-buttons Button {
+    margin-left: 2;
+    border: none;
+    height: 1;
+    min-width: 14;
+}
+
+.modal Input {
+    border: none;
+    height: 1;
+    padding: 0 1;
+    background: $boost;
+}
+
+.modal Input:focus {
+    background: $primary-darken-2;
+    text-style: bold;
+}
+
+/* ------------------------------------------------------ channels view ---- */
+
+ChannelsScreen {
+    layout: vertical;
+    background: $surface;
+}
+
+#chan-title {
+    height: 1;
+    background: $primary-darken-3;
+    padding: 0 1;
+}
+
+#chan-frame,
+#chan-detail {
+    border: round $primary-darken-2;
+    border-title-color: $accent;
+    border-title-align: left;
+}
+
+#chan-frame {
+    height: 1fr;
+    min-height: 6;
+}
+
+#chan-table {
+    height: 1fr;
+    border: none;
+    background: $surface;
+}
+
+#chan-table > .datatable--header {
+    background: $panel;
+    text-style: bold;
+}
+
+#chan-table > .datatable--cursor {
+    background: $primary;
+    text-style: bold;
+}
+
+#chan-detail {
+    height: 2fr;
+    padding: 0 1;
+}
+
+#chan-hint {
+    height: 1;
+    background: $panel;
 }

@@ -42,6 +42,10 @@ class Link(abc.ABC):
     @abc.abstractmethod
     async def command(self, line: str) -> None: ...
 
+    @abc.abstractmethod
+    async def call(self, method: str, **params) -> dict:
+        """Ask the core something and wait for the answer (channels, save_channel...)."""
+
 
 class LocalLink(Link):
     """Runs the core in this process (the default, single-machine setup)."""
@@ -72,6 +76,9 @@ class LocalLink(Link):
     async def command(self, line: str) -> None:
         await self.core.command(line)
 
+    async def call(self, method: str, **params) -> dict:
+        return await self.core.call(method, params)
+
 
 def parse_address(address: str) -> str:
     """'rpi', 'rpi:7373' or 'ws://rpi:7373' -> WebSocket URI."""
@@ -94,6 +101,8 @@ class RemoteLink(Link):
         self._ws: ClientConnection | None = None
         self._reader: asyncio.Task | None = None
         self._closing = False
+        self._calls: dict[int, asyncio.Future] = {}
+        self._call_id = 0
 
     async def connect(self) -> None:
         try:
@@ -116,9 +125,15 @@ class RemoteLink(Link):
         try:
             async for raw in self._ws:
                 try:
-                    self.on_event(json.loads(raw))
+                    event = json.loads(raw)
                 except ValueError:
                     continue
+                if event.get("type") == "reply":
+                    future = self._calls.pop(event.get("id"), None)
+                    if future is not None and not future.done():
+                        future.set_result(event.get("result") or {})
+                    continue
+                self.on_event(event)
         except ConnectionClosed:
             pass
         finally:
@@ -142,6 +157,20 @@ class RemoteLink(Link):
             await self._ws.send(json.dumps({"type": "command", "line": line}))
         except ConnectionClosed:
             self.on_event({"type": "error", "text": "not connected to the server"})
+
+    async def call(self, method: str, **params) -> dict:
+        if self._ws is None:
+            raise LinkError("not connected")
+        self._call_id += 1
+        future = asyncio.get_running_loop().create_future()
+        self._calls[self._call_id] = future
+        await self._ws.send(json.dumps({"type": "call", "id": self._call_id,
+                                        "method": method, "params": params}))
+        try:
+            return await asyncio.wait_for(future, 30)
+        except TimeoutError:
+            self._calls.pop(self._call_id, None)
+            raise LinkError(f"no answer from the server to {method}") from None
 
 
 __all__ = ["Link", "LinkError", "LocalLink", "RemoteLink", "TransportError", "parse_address"]

@@ -171,3 +171,30 @@ msgstr "transmisión y búsqueda detenidas"
 
 msgid "the radio does not answer: it may still hold a previous session (expires in about a minute); waiting... (Ctrl-C to give up)"
 msgstr "la radio no responde: puede que aún tenga abierta una sesión anterior (caduca en un minuto aprox.); esperando... (Ctrl-C para abandonar)"
+
+msgid "/play <file> [MHz] [x2] decode a recording as if it came from the radio"
+msgstr "/play <fichero> [MHz] [x2] decodifica una grabación como si llegara de la radio"
+
+msgid "/play stop              back to the radio audio"
+msgstr "/play stop              vuelve al audio de la radio"
+
+msgid "decoding the station at {freq} from the recording"
+msgstr "decodificando la estación de {freq} de la grabación"
+
+msgid "a recording is playing: searching needs the radio (/play stop)"
+msgstr "se está reproduciendo una grabación: para buscar hace falta la radio (/play stop)"
+
+msgid "the radio was tuned, but the audio still comes from the recording"
+msgstr "se ha sintonizado la radio, pero el audio sigue saliendo de la grabación"
+
+msgid "cannot play {file}: {error}"
+msgstr "no se puede reproducir {file}: {error}"
+
+msgid "playing {file} ({minutes} min, recorded on {freq} MHz)"
+msgstr "reproduciendo {file} ({minutes} min, grabado en {freq} MHz)"
+
+msgid "end of the recording; back to the radio audio"
+msgstr "fin de la grabación; vuelve el audio de la radio"
+
+msgid "playback stopped; back to the radio audio"
+msgstr "reproducción detenida; vuelve el audio de la radio"

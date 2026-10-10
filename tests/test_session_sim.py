@@ -41,7 +41,7 @@ def test_tune_decode_and_transmit():
         session, ui = await _session(sim, tx_enabled=True)
         try:
             await session.execute("/f 7.012")
-            await asyncio.sleep(5)
+            await asyncio.sleep(8)  # the Bayesian decoder writes words with ~2 words of delay
             assert "DE EA4SIM" in "".join(ui.rx)
             await session.execute("/wpm 30")
             await session.execute("cq de {call} <ar>")
@@ -97,3 +97,60 @@ def test_receive_only_never_keys_the_radio():
             await session.stop()
 
     asyncio.run(scenario())
+
+
+def test_play_recording_through_the_skimmer(tmp_path):
+    import json
+    import wave
+
+    import numpy as np
+
+    from cwic705.synth import cw_signal, noise
+
+    fs, seconds = 8000, 40
+    n = fs * seconds
+    x = noise(n, 0.03, np.random.default_rng(9))
+    for tone, text, wpm in ((700, "CQ DE EA1AAA EA1AAA K", 20), (1300, "TEST DL2BBB DL2BBB", 26)):
+        sig = cw_signal(text, wpm, tone, fs, 0.25, lead=0.5, tail=1.5)
+        x += np.tile(sig, n // len(sig) + 1)[:n]
+    wav_path = tmp_path / "rec.wav"
+    with wave.open(str(wav_path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(fs)
+        wav.writeframes((np.clip(x, -1, 1) * 32767).astype("<i2").tobytes())
+    (tmp_path / "rec.json").write_text(json.dumps({"frequency": [[0, 7_010_000]]}))
+
+    async def scenario():
+        sim = SimTransport(stations=[], frequency=14_060_000, seed=4)
+        session, ui = await _session(sim)
+        try:
+            await session.execute("/skim")
+            await session.execute(f"/play {wav_path} x10")
+            await asyncio.sleep(seconds / 10 + 0.5)
+            spots = {i for i in ui.infos if i.startswith("spot")}
+            assert any("7.010.10" in s and "EA1AAA" in s for s in spots), spots
+            assert any("7.010.70" in s and "DL2BBB" in s for s in spots), spots
+            assert any("end of the recording" in i for i in ui.infos)
+            assert sim.frequency == 14_060_000  # the radio was never retuned
+        finally:
+            await session.stop()
+
+    asyncio.run(scenario())
+
+
+def test_recording_writes_frequency_sidecar(tmp_path):
+    import json
+
+    async def scenario():
+        sim = SimTransport(stations=[], frequency=7_030_000, seed=5)
+        session, ui = await _session(sim)
+        session.record_to(str(tmp_path / "out.wav"))
+        await asyncio.sleep(0.5)
+        await session.execute("/f 7.012")
+        await asyncio.sleep(0.5)
+        await session.stop()
+
+    asyncio.run(scenario())
+    timeline = json.loads((tmp_path / "out.json").read_text())["frequency"]
+    assert [f for _, f in timeline] == [7_030_000, 7_012_000]

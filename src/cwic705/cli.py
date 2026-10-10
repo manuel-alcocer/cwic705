@@ -38,6 +38,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                       help="receive audio sample rate (default 8000)")
     conn.add_argument("--usb", metavar="DEVICE", help="connect over USB (next version)")
     conn.add_argument("--sim", action="store_true", help="use the built-in radio simulator")
+    conn.add_argument("--wav", metavar="FILE", type=Path,
+                      help="decode a recording as if it came from the radio (no radio needed)")
+    conn.add_argument("--wav-freq", metavar="MHZ",
+                      help="dial frequency of the recording, if it has no .json sidecar")
     p.add_argument("--call", help="your callsign (used in macros)")
     p.add_argument("--wpm", type=int, help="keyer speed set at start-up")
     p.add_argument("--tx", action="store_true",
@@ -75,6 +79,15 @@ def setup_logging(debug: bool, trace: bool) -> Path:
 
 
 def build_transport(args: argparse.Namespace, config) -> Transport:
+    if args.wav:
+        from cwic705.bands import parse_frequency
+        from cwic705.playback import load_sidecar
+        from cwic705.transport.sim import SimTransport
+
+        timeline = load_sidecar(args.wav)
+        freq = parse_frequency(args.wav_freq) if args.wav_freq else \
+            (timeline[0][1] if timeline else 7_030_000)
+        return SimTransport(config.sample_rate, stations=[], frequency=freq)
     if args.sim:
         from cwic705.transport.sim import SimTransport
         return SimTransport(config.sample_rate)
@@ -98,23 +111,33 @@ def _signals(stop: asyncio.Event) -> None:
             loop.add_signal_handler(sig, stop.set)
 
 
-async def run_client(link: Link, plain: bool) -> int:
+def client_scp(config) -> set[str]:
+    """MASTER.SCP on the client machine, used to tidy callsigns in the translation."""
+    from cwic705.skimmer import load_scp
+
+    return load_scp(config.scp_path) if config.scp_path.exists() else set()
+
+
+async def run_client(link: Link, plain: bool, startup: list[str] | None = None,
+                     scp: set[str] | None = None) -> int:
     """A user interface on a link (local core or remote server)."""
     if not plain:
         from cwic705.tui import CwApp
 
-        return await CwApp(link).run_async() or 0
+        return await CwApp(link, startup=startup, scp=scp).run_async() or 0
     from cwic705.plain import PlainClient
 
     stop = asyncio.Event()
     _signals(stop)
-    client = PlainClient(link, stop)
+    client = PlainClient(link, stop, scp=scp)
     try:
         await link.connect()
     except (LinkError, TransportError, CivError, OSError) as exc:
         await link.close()
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    for line in startup or []:
+        await link.command(line)
     try:
         await client.run()
     finally:
@@ -151,7 +174,7 @@ async def run_server(transport: Transport, config, record: Path | None) -> int:
     await stop.wait()
     starting.cancel()
     await serving
-    await core.stop()
+    await core.stop(autosave=config.autosave_on_exit)
     return 0
 
 
@@ -212,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
             print("error: no server address; use --connect HOST[:PORT] or [client] connect "
                   "in the config", file=sys.stderr)
             return 1
-        coro = run_client(RemoteLink(address, args.token or config.client_token), args.plain)
+        coro = run_client(RemoteLink(address, args.token or config.client_token), args.plain,
+                          scp=client_scp(config))
     else:
         transport = build_transport(args, config)
         if args.serve:
@@ -223,7 +247,10 @@ def main(argv: list[str] | None = None) -> int:
             link = LocalLink(transport, config)
             if args.record is not None:
                 link.core.session.record_to(str(args.record))
-            coro = run_client(link, args.plain)
+            startup = []
+            if args.wav:
+                startup.append(f"/play {args.wav}" + (f" {args.wav_freq}" if args.wav_freq else ""))
+            coro = run_client(link, args.plain, startup, scp=client_scp(config))
     with contextlib.suppress(KeyboardInterrupt):
         code = asyncio.run(coro)
         if code:

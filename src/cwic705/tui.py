@@ -19,18 +19,22 @@ from textual.widgets import DataTable, Input, Label, Static
 
 from cwic705 import bands
 from cwic705.i18n import N_, _, render
+from cwic705.interpret import Interpretation, Interpreter, interpret
 from cwic705.links import Link, LinkError
 from cwic705.radio import CivError, smeter_text
+from cwic705.screens import ChannelsScreen, ChoiceScreen, NameScreen
 from cwic705.transport import TransportError
 
 MAX_LINES = 2000
 LINE_HISTORY = 100
 
 STYLES = {"rx": "white", "tx": "bold yellow", "info": "cyan", "error": "bold red",
-          "spot": "bold green"}
+          "spot": "bold green", "summary": "bold white", "glossary": "dim",
+          "history": "dim italic"}
 
-HELP_HINT = N_("F1 Help · F2-F9 Macros · F10 Skimmer · Esc Stop · PgUp/PgDn Tune · Ctrl+Q Quit")
-SHORT_HINT = N_("F1 Help · F10 Skimmer · Esc Stop · Ctrl+Q Quit")
+HELP_HINT = N_("F1 Help · F2-F9 Macros · F10 Skimmer · F11 Channels · Esc Stop · "
+               "PgUp/PgDn Tune · Ctrl+Q Quit")
+SHORT_HINT = N_("F1 Help · F10 Skimmer · F11 Channels · Ctrl+Q Quit")
 _KEY = re.compile(r"F\d+(?:-F\d+)?|Esc|PgUp/PgDn|Ctrl\+\w|Enter|↑↓")
 
 
@@ -66,6 +70,11 @@ class StatusLine(Static):
             badge(_("TX"), "bold white on red")
         elif st and not st.get("tx_enabled"):
             badge(_("RX ONLY"), "bold black on yellow")
+        play = st.get("playback")
+        if play:
+            badge(f"▶ {play['file']} {int(play['elapsed']) // 60}:{int(play['elapsed']) % 60:02d}"
+                  f"/{int(play['duration']) // 60}:{int(play['duration']) % 60:02d}",
+                  "bold black on magenta")
         if st.get("scanning"):
             badge(f"{_('SCAN')} {bands.format_frequency(st.get('scan_freq'))}", "bold black on cyan")
         if st.get("skimming"):
@@ -143,6 +152,7 @@ class DetailPanel(Static):
         self.state: dict = {}
         self.channels: list[dict] = []
         self.selected = 0
+        self.meaning = ""  # plain-language summary of the selected skimmer station
 
     def render(self) -> Text:
         st = self.state
@@ -174,7 +184,12 @@ class DetailPanel(Static):
             else:
                 text.append(_("Looking for CW signals..."), style="dim")
             text.append("\n")
-            _append_keys(text, _("↑↓ select a station · Enter tune it · F10 back to single decoding"))
+            if self.meaning:
+                text.append("≈ ", style="bold green")
+                text.append(self.meaning, style="white")
+            else:
+                _append_keys(text, _("↑↓ select a station · Enter tune it · "
+                                     "F10 back to single decoding"))
             return text
 
         d = st.get("decoder", {})
@@ -238,20 +253,26 @@ class CwApp(App[int]):
         *(Binding(f"f{n}", f"command('/macro F{n}')", show=False, priority=True)
           for n in range(2, 10)),
         Binding("f10", "command('/skim')", show=False, priority=True),
-        Binding("escape", "command('/stop')", show=False, priority=True),
-        Binding("pageup", "command('/up 100')", show=False, priority=True),
-        Binding("pagedown", "command('/down 100')", show=False, priority=True),
-        Binding("up", "arrow(-1)", show=False, priority=True),
-        Binding("down", "arrow(1)", show=False, priority=True),
+        Binding("f11", "channels", show=False, priority=True),
+        Binding("escape", "command('/stop')", show=False),
+        Binding("pageup", "command('/up 100')", show=False),
+        Binding("pagedown", "command('/down 100')", show=False),
+        Binding("up", "arrow(-1)", show=False),
+        Binding("down", "arrow(1)", show=False),
         Binding("ctrl+q", "leave", show=False, priority=True),
     ]
 
-    def __init__(self, link: Link) -> None:
+    def __init__(self, link: Link, startup: list[str] | None = None,
+                 scp: set[str] | None = None) -> None:
         super().__init__()
         self.link = link
+        self.scp = scp or set()
+        self.startup = startup or []
         self.state: dict = {}
         self.welcome: dict = {}
         self.exit_code = 0
+        self.interpreter = Interpreter(scp=self.scp)
+        self.state_frequency: int | None = None
         self._history: list[str] = []
         self._history_index = 0
 
@@ -262,6 +283,8 @@ class CwApp(App[int]):
         with Vertical(id="main-frame"):
             yield TextPane(id="rx")
             yield DataTable(id="skim", cursor_type="row", zebra_stripes=False)
+        with Vertical(id="meaning-frame"):
+            yield TextPane(id="meaning")
         yield DetailPanel(id="detail")
         with Vertical(id="entry"):
             with Horizontal(id="entry-row"):
@@ -275,6 +298,10 @@ class CwApp(App[int]):
         table.display = False
         self.query_one("#main-frame").border_title = _("Receive")
         self.query_one("#detail").border_title = _("Detail")
+        self.query_one("#meaning-frame").border_title = _("Translation")
+        self.query_one("#meaning", TextPane).add(
+            "glossary", _("The meaning of each transmission appears here once it ends."))
+        self.set_interval(1.0, self._interpreter_tick)
         self._update_entry_title()
         self.query_one("#entry-input", Input).focus()
         self.link.on_event = self._on_event
@@ -288,6 +315,8 @@ class CwApp(App[int]):
             self._message("info", _("press Ctrl+Q to leave"))
             self.exit_code = 1
             return
+        for line in self.startup:
+            await self.link.command(line)
         await self.link.closed.wait()
         self._message("error", _("the link to the core has ended; press Ctrl+Q to leave"))
 
@@ -302,6 +331,8 @@ class CwApp(App[int]):
             self._apply_skim(event["channels"])
         elif kind == "rx":
             pane.add("rx", event["text"], append=True)
+            for result in self.interpreter.feed(event["text"]):
+                self._show_meaning(result)
             footer = self.query_one("#stats", StatsFooter)
             footer.rx_chars += len(event["text"].strip())
         elif kind == "tx":
@@ -312,6 +343,22 @@ class CwApp(App[int]):
         elif kind == "welcome":
             self.welcome = event
             self._update_entry_title()
+        elif kind == "history":
+            # Picked from the skimmer: what was heard before keeps the thread of the QSO.
+            pane.add("history", "── " + _("earlier on {title}").format(title=event["title"]) + " ──")
+            pane.add("history", event["text"][-600:])
+
+    def _interpreter_tick(self) -> None:
+        result = self.interpreter.tick()
+        if result is not None:
+            self._show_meaning(result)
+
+    def _show_meaning(self, result: Interpretation) -> None:
+        pane = self.query_one("#meaning", TextPane)
+        if result.summary:
+            pane.add("summary", "≈ " + ". ".join(result.summary) + ".")
+        if result.glossary:
+            pane.add("glossary", "   " + " · ".join(f"{w} = {m}" for w, m in result.glossary))
 
     def _message(self, kind: str, text: str) -> None:
         self.query_one("#rx", TextPane).add(kind, text)
@@ -328,9 +375,13 @@ class CwApp(App[int]):
         detail.state = state
         detail.refresh()
         self.query_one("#stats", StatsFooter).spots = state.get("spots", 0)
+        if state.get("frequency") != self.state_frequency:
+            self.state_frequency = state.get("frequency")
+            self.interpreter = Interpreter(scp=self.scp)  # a new frequency is a new conversation
         if state.get("skimming") != was_skimming:
             skimming = state.get("skimming", False)
             self.query_one("#rx").display = not skimming
+            self.query_one("#meaning-frame").display = not skimming
             self.query_one("#skim").display = skimming
             frame = self.query_one("#main-frame")
             frame.border_title = _("Skimmer") if skimming else _("Receive")
@@ -355,6 +406,14 @@ class CwApp(App[int]):
             table.move_cursor(row=min(row, len(channels) - 1))
         detail.channels = channels
         detail.selected = table.cursor_row if channels else 0
+        self._update_selected_meaning()
+
+    def _update_selected_meaning(self) -> None:
+        detail = self.query_one("#detail", DetailPanel)
+        detail.meaning = ""
+        if 0 <= detail.selected < len(detail.channels):
+            words = detail.channels[detail.selected]["text"].split()[1:][-15:]  # first is cut
+            detail.meaning = ". ".join(interpret(words, self.scp).summary)
         detail.refresh()
 
     def _update_entry_title(self) -> None:
@@ -393,7 +452,7 @@ class CwApp(App[int]):
                 table.move_cursor(row=max(0, min(table.row_count - 1, table.cursor_row + step)))
                 detail = self.query_one("#detail", DetailPanel)
                 detail.selected = table.cursor_row
-                detail.refresh()
+                self._update_selected_meaning()
             return
         if not self._history:
             return
@@ -402,6 +461,81 @@ class CwApp(App[int]):
         field.value = self._history[self._history_index] if self._history_index < len(self._history) else ""
         field.cursor_position = len(field.value)
 
+    def action_channels(self) -> None:
+        if not isinstance(self.screen, ChannelsScreen):
+            self.push_screen(ChannelsScreen())
+
     async def action_leave(self) -> None:
+        self.run_worker(self._leave(), exclusive=True, group="leave")
+
+    async def _leave(self) -> None:
+        """Offer to archive the unsaved channels, then quit."""
+        try:
+            listing = await self.link.call("channels")
+        except Exception:
+            listing = {}
+        pending = [c for c in listing.get("session", []) if c.get("unsaved")]
+        if pending:
+            names = ", ".join(c["label"] for c in pending[:8]) + ("..." if len(pending) > 8 else "")
+            options = [("audio", _("Save with audio")), ("text", _("Save without audio")),
+                       ("no", _("Don't save")), ("cancel", _("Cancel"))]
+            if not listing.get("audio_available", True):
+                options = [o for o in options if o[0] != "audio"]
+            choice = await self.push_screen_wait(ChoiceScreen(
+                _("Save channels"),
+                _("{n} channels of this session are not saved: {names}").format(
+                    n=len(pending), names=names), options))
+            if choice in ("", "cancel"):
+                return
+            if choice in ("audio", "text"):
+                for channel in pending:
+                    await self.save_channel_flow(channel, audio=choice == "audio")
         await self.link.close()
         self.exit(self.exit_code)
+
+    async def save_channel_flow(self, channel: dict, audio: bool = False,
+                                ask_audio: bool = False) -> None:
+        """Archive one channel, asking for a name when it has no callsign and before
+        reusing an existing name (append mode)."""
+        if ask_audio:
+            choice = await self.push_screen_wait(ChoiceScreen(
+                _("Save channel"), _("Save {label} with its audio?").format(label=channel["label"]),
+                [("audio", _("With audio")), ("text", _("Text only")), ("cancel", _("Cancel"))]))
+            if choice in ("", "cancel"):
+                return
+            audio = choice == "audio"
+        params: dict = {"id": channel["id"], "audio": audio}
+        while True:
+            result = await self.link.call("save_channel", **params)
+            status = result.get("status")
+            if status == "needs_name":
+                name = await self.push_screen_wait(NameScreen(
+                    _("Name the channel"),
+                    _("The channel {label} has no callsign. Name for it (empty: {suggestion}):")
+                    .format(label=result.get("label", channel["label"]),
+                            suggestion=result.get("suggestion", "")),
+                    placeholder=result.get("suggestion", "")))
+                if name is None:
+                    return  # skipped
+                params.update(name=name.strip(), auto=not name.strip(), append=False)
+            elif status == "name_exists":
+                answer = await self.push_screen_wait(ChoiceScreen(
+                    _("Name in use"),
+                    _("A channel named «{name}» already exists. Add this conversation to it?")
+                    .format(name=result["name"]),
+                    [("yes", _("Yes, append")), ("no", _("No, another name"))]))
+                if answer == "yes":
+                    params["append"] = True
+                else:
+                    params.pop("name", None)
+                    params.pop("auto", None)
+            elif status in ("saved", "appended"):
+                msg = _("channel saved as «{name}»") if status == "saved" else \
+                    _("conversation added to channel «{name}»")
+                self._message("info", msg.format(name=result["name"]))
+                return
+            else:
+                if status == "error":
+                    self._message("error", _("cannot save {label}: {error}").format(
+                        label=channel["label"], error=result.get("error")))
+                return

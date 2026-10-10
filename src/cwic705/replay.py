@@ -3,22 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import wave
 
 import numpy as np
 
 from cwic705.decoder import CwDecoder, find_tone
-
-
-def load_wav(path: str) -> tuple[np.ndarray, int]:
-    with wave.open(path, "rb") as wav:
-        if wav.getsampwidth() != 2:
-            raise SystemExit("only 16-bit WAV files are supported")
-        rate, channels = wav.getframerate(), wav.getnchannels()
-        data = np.frombuffer(wav.readframes(wav.getnframes()), "<i2").astype(np.float32) / 32768
-    if channels > 1:
-        data = data.reshape(-1, channels).mean(axis=1)
-    return data, rate
+from cwic705.playback import load_wav
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,9 +17,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--wpm", type=float, default=18, help="initial speed estimate")
     p.add_argument("--no-afc", action="store_true")
     p.add_argument("--stats", action="store_true", help="print decoder state every second")
+    p.add_argument("--skim", action="store_true",
+                   help="run the multi-signal skimmer instead of the single decoder")
     args = p.parse_args(argv)
 
     samples, rate = load_wav(args.wav)
+    if args.skim:
+        return skim(samples, rate)
     tone, score = find_tone(samples, rate, 200, 1500)
     print(f"{len(samples) / rate:.1f} s at {rate} Hz; strongest tone {tone or 0:.0f} Hz "
           f"(peak/median {score:.1f})")
@@ -45,6 +38,34 @@ def main(argv: list[str] | None = None) -> int:
                   f" | {''.join(out)[-50:]}")
     decoder.process(np.zeros(rate * 2, np.float32))
     print("".join(out).strip())
+    return 0
+
+
+def skim(samples: np.ndarray, rate: int) -> int:
+    """Print each callsign as the skimmer validates it, then every channel's text."""
+    from cwic705.config import DEFAULT_SCP_PATH
+    from cwic705.skimmer import Skimmer, load_scp
+
+    scp = load_scp(DEFAULT_SCP_PATH) if DEFAULT_SCP_PATH.exists() else set()
+    texts: dict[int, str] = {}
+
+    def spot(ch) -> None:
+        known = "  (MASTER.SCP)" if ch.callsign in scp else ""
+        print(f"[{sk._clock:6.1f}s] {ch.tone:5.0f} Hz  {ch.wpm:4.1f} wpm  {ch.callsign}{known}")
+
+    sk = Skimmer(rate, scp=scp, on_callsign=spot)
+    print(f"{len(samples) / rate:.1f} s at {rate} Hz; {len(scp)} callsigns in MASTER.SCP\n"
+          "-- callsigns validated:")
+    step = rate // 50
+    for i in range(0, len(samples), step):
+        sk.process(samples[i:i + step])
+        for ch in sk.channels:
+            texts[id(ch)] = f"{ch.tone:5.0f} Hz | {' '.join(ch.text.split())}"
+    print("-- text of the channels opened (last 100 characters each):")
+    for line in texts.values():
+        head, _, text = line.partition(" | ")
+        if len(text) > 20:
+            print(f"{head} | {text[-100:]}")
     return 0
 
 

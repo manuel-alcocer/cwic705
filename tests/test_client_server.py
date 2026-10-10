@@ -43,7 +43,7 @@ def test_remote_client_receives_events_and_runs_commands():
         try:
             await link.connect()
             await link.command("/f 7.012")
-            await asyncio.sleep(5)
+            await asyncio.sleep(8)  # the Bayesian decoder writes words with ~2 words of delay
             kinds = {e["type"] for e in events}
             assert {"welcome", "state", "info", "rx"} <= kinds
             assert sim.frequency == 7_012_000

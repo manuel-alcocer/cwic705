@@ -45,10 +45,21 @@ tx_enabled = false
 
 [decoder]
 afc = true
+# "bayes": probabilistic decoder with a CW language model (default); "classic": thresholds
+# engine = "bayes"
 
 [skimmer]
 # Super Check Partial database used to validate callsigns (cwic705 --update-scp)
 # scp_path = "~/.config/cwic705/MASTER.SCP"
+
+[channels]
+# Archive of channels (conversations): any SQLAlchemy URL. Default: SQLite file.
+# database = "sqlite:///~/.local/share/cwic705/channels.db"
+# database = "postgresql+psycopg://user:password@host/cwic705"   (pip install cwic705[postgres])
+# Keep the session audio so channels can be saved with lossless FLAC audio
+audio = true
+# --serve: archive unsaved channels automatically when the server stops
+autosave_on_server_exit = true
 
 [ui]
 # Interface language: "en" or "es" (default: the system language; CWIC705_LANG overrides)
@@ -87,7 +98,11 @@ class Config:
     wpm: int = 20
     tx_enabled: bool = False
     afc: bool = True
+    decoder: str = "bayes"   # "bayes" (probabilistic) or "classic"
     scp_path: Path = DEFAULT_SCP_PATH
+    channels_db: str = ""            # SQLAlchemy URL; "" = SQLite in ~/.local/share/cwic705
+    channel_audio: bool = True       # keep the session audio so channels can be saved with it
+    autosave_on_exit: bool = True    # server mode: archive unsaved channels when stopping
     language: str = ""
     listen: str = "127.0.0.1:7373"
     server_token: str = ""
@@ -113,9 +128,14 @@ def load_config(path: Path | None = None) -> Config:
         cfg.wpm = int(data.get("keyer", {}).get("wpm", cfg.wpm))
         cfg.tx_enabled = bool(data.get("keyer", {}).get("tx_enabled", cfg.tx_enabled))
         cfg.afc = bool(data.get("decoder", {}).get("afc", cfg.afc))
+        cfg.decoder = str(data.get("decoder", {}).get("engine", cfg.decoder))
         if "scp_path" in data.get("skimmer", {}):
             cfg.scp_path = Path(data["skimmer"]["scp_path"]).expanduser()
         cfg.language = str(data.get("ui", {}).get("language", cfg.language))
+        chans = data.get("channels", {})
+        cfg.channels_db = str(chans.get("database", cfg.channels_db))
+        cfg.channel_audio = bool(chans.get("audio", cfg.channel_audio))
+        cfg.autosave_on_exit = bool(chans.get("autosave_on_server_exit", cfg.autosave_on_exit))
         server, client = data.get("server", {}), data.get("client", {})
         cfg.listen = str(server.get("listen", cfg.listen))
         cfg.server_token = str(server.get("token", cfg.server_token))

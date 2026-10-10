@@ -7,6 +7,7 @@ import contextlib
 import logging
 import time
 import wave
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -17,6 +18,8 @@ from cwic705.config import Config
 from cwic705.decoder import CwDecoder
 from cwic705.i18n import N_
 from cwic705.radio import BREAK_IN_SEMI, CivError, Radio
+from cwic705.channels import AudioSpool, ChannelBook, ChannelRecord, ChannelStore
+from cwic705.playback import SidecarWriter, WavPlayback
 from cwic705.scanner import STEP_HZ, Scanner
 from cwic705.skimmer import Channel, Skimmer, load_scp
 from cwic705.transport import Transport, TransportError
@@ -44,6 +47,8 @@ HELP = [
     N_('/call <CALL>            your callsign for macros /macros      list F-key macros'),
     N_('/skim  (F10)            skimmer: decode every CW signal in a 3.6 kHz window'),
     N_('/go <n>                 tune to skimmer station n and leave the skimmer'),
+    N_('/play <file> [MHz] [x2] decode a recording as if it came from the radio'),
+    N_('/play stop              back to the radio audio'),
     N_('/raw <hex>              send a raw CI-V command body, e.g. /raw 03'),
     N_('/clear  /help  /quit'),
 ]
@@ -69,10 +74,23 @@ class Session:
         self.radio.on_state = ui.status_changed
         self.radio.tx_enabled = config.tx_enabled
         self.audio = AudioRing(transport.sample_rate)
-        self.decoder = CwDecoder(transport.sample_rate, on_text=self._on_rx_text)
+        self.scp: set[str] = load_scp(config.scp_path) if config.scp_path.exists() else set()
+        self.decoder_class: type[CwDecoder] = CwDecoder
+        if config.decoder == "bayes":
+            from cwic705.bayes import BayesDecoder
+
+            self.decoder_class = BayesDecoder
+            self.decoder = BayesDecoder(transport.sample_rate, on_text=self._on_rx_text,
+                                        scp=self.scp)
+        else:
+            self.decoder = CwDecoder(transport.sample_rate, on_text=self._on_rx_text)
         self._rx_pending = ""
         self._rx_flushed = time.monotonic()
         self._recorder: wave.Wave_write | None = None
+        self._sidecar: SidecarWriter | None = None
+        self._recorded = 0
+        self.playback: WavPlayback | None = None
+        self._playback_task: asyncio.Task | None = None
         self.decoder.afc = config.afc
         self.scanner = Scanner(self.radio, self.audio, self._scan_progress)
         self.connected = False
@@ -80,12 +98,17 @@ class Session:
         self.scanning = False
         self.scan_freq: int | None = None
         self.skimmer: Skimmer | None = None
+        self._paused_skim: tuple[Skimmer, int | None] | None = None  # kept while away
+        self.book = ChannelBook(self.scp, on_change=self._channels_changed,
+                                sample_rate=transport.sample_rate)
+        self.channels_version = 0
+        self.spool = AudioSpool(transport.sample_rate) if config.channel_audio else None
+        self._store: ChannelStore | None = None
+        self._decoding_freq: int | None = None  # station decoded from a recording (/go)
         self.spots = 0
         self._skim_saved_filter: int | None = None
         self._skim_filter: int = SKIM_FILTER_HZ  # IF width actually in use while skimming
-        self.scp: set[str] = set()
-        if config.scp_path.exists():
-            self.scp = load_scp(config.scp_path)
+        if self.scp:
             log.info("loaded %d callsigns from %s", len(self.scp), config.scp_path)
         self.quit_event = asyncio.Event()
         self._tx_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -102,11 +125,17 @@ class Session:
         self._recorder.setnchannels(1)
         self._recorder.setsampwidth(2)
         self._recorder.setframerate(self.transport.sample_rate)
+        self._sidecar = SidecarWriter(path, self.transport.sample_rate)
         log.info("recording receive audio to %s", path)
 
     def _on_rx_text(self, text: str) -> None:
         self._rx_pending += text
         self.ui.rx_text(text)
+        self.book.tuned_rx(self._decoding_freq or self.dial_frequency, text, self.decoder.wpm,
+                           self.decoder.snr_db, self.spool.position if self.spool else None)
+
+    def _channels_changed(self) -> None:
+        self.channels_version += 1
 
     def _flush_rx_log(self, force: bool = False) -> None:
         """Write decoded text to the log with the conditions it was decoded under."""
@@ -153,8 +182,15 @@ class Session:
 
     # ---- skimmer ----------------------------------------------------------------------------------
 
+    @property
+    def dial_frequency(self) -> int | None:
+        """Frequency the audio being decoded was received on (the recording's while playing)."""
+        if self.playback is not None:
+            return self.playback.frequency
+        return self.radio.state.frequency
+
     def channel_frequency(self, ch: Channel) -> int | None:
-        dial = self.radio.state.frequency
+        dial = self.dial_frequency
         if dial is None:
             return None
         return round(dial + self.scanner.sideband_sign * (ch.tone - self.radio.state.pitch))
@@ -162,12 +198,16 @@ class Session:
     def skim_range(self) -> tuple[int, int] | None:
         """RF range the skimmer analyses: the IF filter (centred on the CW pitch)
         intersected with the audio band the skimmer looks at, mapped to the dial."""
-        dial = self.radio.state.frequency
+        dial = self.dial_frequency
         if self.skimmer is None or dial is None:
             return None
         pitch, half = self.radio.state.pitch, self._skim_filter / 2
-        audio_lo = max(self.skimmer.f_lo, pitch - half)
-        audio_hi = min(self.skimmer.f_hi, pitch + half)
+        if self.skimmer.passband is not None:
+            # Measured on the audio itself: right for recordings and whatever the filter is.
+            audio_lo, audio_hi = self.skimmer.passband
+        else:
+            audio_lo = max(self.skimmer.f_lo, pitch - half)
+            audio_hi = min(self.skimmer.f_hi, pitch + half)
         sign = self.scanner.sideband_sign
         ends = sorted(round(dial + sign * (a - pitch)) for a in (audio_lo, audio_hi))
         return ends[0], ends[1]
@@ -175,6 +215,7 @@ class Session:
     def _on_spot(self, ch: Channel) -> None:
         self.spots += 1
         freq = self.channel_frequency(ch)
+        self.book.skimmer_validated(ch, freq)
         known = " (SCP)" if ch.callsign in self.scp else ""
         self.ui.info(N_("spot {freq}  {call}{known}  {wpm} wpm  {snr} dB"),
                      freq=bands.format_frequency(freq), call=ch.callsign, known=known,
@@ -193,7 +234,21 @@ class Session:
             self._skim_filter = SKIM_FILTER_HZ
         except CivError as exc:
             log.warning("skimmer: cannot widen the filter: %s", exc)
-        self.skimmer = Skimmer(self.transport.sample_rate, scp=self.scp, on_callsign=self._on_spot)
+        if self._paused_skim is not None:
+            # Back from a station: the stations found before are still there, moved by
+            # however much the dial moved meanwhile.
+            self.skimmer, old_dial = self._paused_skim
+            self._paused_skim = None
+            new_dial = self.dial_frequency
+            if old_dial is not None and new_dial is not None and new_dial != old_dial:
+                self.skimmer.shift(self.scanner.sideband_sign * (new_dial - old_dial))
+            self._decoding_freq = None
+            self.ui.status_changed()
+            self.ui.info(N_("skimmer resumed with {count} stations"), count=len(self.skimmer.channels))
+            return
+        self.skimmer = Skimmer(self.transport.sample_rate, scp=self.scp, on_callsign=self._on_spot,
+                               decoder_class=self.decoder_class,
+                               on_channel_text=self._skim_text)
         if self.scp:
             self.ui.info(N_("skimmer on: decoding every signal in the passband; "
                             "{count} callsigns in MASTER.SCP"), count=len(self.scp))
@@ -202,9 +257,15 @@ class Session:
                             "no MASTER.SCP (cwic705 --update-scp)"))
         self.ui.status_changed()
 
-    async def stop_skim(self) -> None:
+    def _skim_text(self, ch: Channel, text: str) -> None:
+        self.book.skimmer_rx(ch, text, self.channel_frequency(ch),
+                             self.spool.position if self.spool else None)
+
+    async def stop_skim(self, keep: bool = True) -> None:
         if self.skimmer is None:
             return
+        if keep:
+            self._paused_skim = (self.skimmer, self.dial_frequency)
         self.skimmer = None
         if self._skim_saved_filter:
             try:
@@ -221,6 +282,25 @@ class Session:
             raise ValueError("no such skimmer station")
         ch = self.skimmer.channels[index]
         dial, pitch = self.radio.state.frequency, self.radio.state.pitch
+        station_freq = self.channel_frequency(ch)
+        record = self.book.record_for(ch)
+        if record is None:
+            record = self.book._new("tuned", station_freq)
+            record.callsign = ch.callsign
+            record.seed(ch.text)
+            self.book.attach(ch, record)  # its callsign, once validated, names this channel
+        self.book.follow(record, station_freq)
+        history = getattr(self.ui, "history", None)
+        if history is not None and record.text.strip():
+            history(record.label, record.text)  # what was heard before, to keep the thread
+        if self.playback is not None:
+            # A recording cannot be retuned: decode that station on its own tone instead.
+            await self.stop_skim()
+            self._decoding_freq = station_freq
+            self.decoder.reset(ch.tone)
+            self.ui.info(N_("decoding the station at {freq} from the recording"),
+                         freq=bands.format_frequency(self.channel_frequency(ch)))
+            return
         await self.stop_skim()
         if dial is not None:
             freq = await self.scanner.centre(dial, ch.tone, pitch)
@@ -231,8 +311,91 @@ class Session:
             else:
                 self.ui.info(N_("tuned to {freq} MHz"), freq=bands.format_frequency(freq))
 
+    # ---- channel archive -----------------------------------------------------------------------
+
+    @property
+    def store(self) -> ChannelStore:
+        if self._store is None:
+            self._store = ChannelStore(self.config.channels_db or None)
+        return self._store
+
+    def list_channels(self) -> dict:
+        try:
+            saved = self.store.list()
+            error = None
+        except Exception as exc:  # unreachable PostgreSQL, bad URL...
+            log.error("channel archive: %s", exc)
+            saved, error = [], str(exc)
+        return {"session": self.book.summaries(), "saved": saved, "error": error,
+                "audio_available": self.spool is not None}
+
+    def channel_transcript(self, channel_id: int, saved: bool) -> dict | None:
+        if saved:
+            return self.store.transcript(channel_id)
+        record = self.book.get(channel_id)
+        if record is None:
+            return None
+        entries = list(record.entries)
+        if record._line.strip():
+            entries.append({"utc": record.last, "kind": "rx", "text": record._line.strip()})
+        return {"id": record.id, "name": record.label, "callsign": record.callsign,
+                "frequency": record.frequency, "stats": record.stats.as_dict(),
+                "entries": entries, "audio": []}
+
+    def save_channel(self, channel_id: int, name: str | None = None, auto: bool = False,
+                     append: bool = False, audio: bool = False) -> dict:
+        """Archive a session channel. Status: saved | appended | needs_name | name_exists |
+        empty | error. With a callsign the key is (callsign, frequency): an archived channel
+        with that key is appended to. Without one the caller must give a name (auto=True
+        picks "Channel N"); an existing name is only appended to when append=True."""
+        record = self.book.get(channel_id)
+        if record is None or not record.stats.words:
+            return {"status": "empty", "id": channel_id}
+        try:
+            store = self.store
+            target = None
+            if record.archive_id is not None:  # saved earlier in this session: continue it
+                target = store.by_name(record.archive_name)
+            elif record.callsign:
+                target = store.by_key(record.callsign, record.frequency)
+                if target is None:
+                    name = name or record.callsign
+                    if store.by_name(name):
+                        name = f"{record.callsign} {bands.format_frequency(record.frequency)}"
+            else:
+                if auto or (name is not None and not name.strip()):
+                    name = store.auto_name()
+                elif not name:
+                    return {"status": "needs_name", "id": channel_id,
+                            "label": record.label, "suggestion": store.auto_name()}
+                existing = store.by_name(name.strip())
+                if existing is not None:
+                    if not append:
+                        return {"status": "name_exists", "id": channel_id, "name": name.strip()}
+                    target = existing
+                name = name.strip()
+            archive_id, saved_name = store.save(record, name, target, self.spool, audio)
+        except Exception as exc:
+            log.exception("saving channel %s", channel_id)
+            return {"status": "error", "id": channel_id, "error": str(exc)}
+        self._channels_changed()
+        return {"status": "appended" if target is not None else "saved", "id": channel_id,
+                "name": saved_name, "archive_id": archive_id}
+
+    def autosave(self) -> int:
+        """Archive every unsaved channel without asking (server shutdown)."""
+        saved = 0
+        for record in self.book.records:
+            record.flush()
+            if record.unsaved:
+                result = self.save_channel(record.id, auto=True, append=True,
+                                           audio=self.config.channel_audio)
+                saved += result["status"] in ("saved", "appended")
+        return saved
+
     async def stop(self) -> None:
-        for task in [*self._tasks, self._scan_task, self._tx_current, self._reconnect_task]:
+        for task in [*self._tasks, self._scan_task, self._tx_current, self._reconnect_task,
+                     self._playback_task]:
             if task is not None:
                 task.cancel()
         if self.connected and self.skimmer is not None:
@@ -246,6 +409,14 @@ class Session:
         if self._recorder is not None:
             self._recorder.close()
             self._recorder = None
+        if self._sidecar is not None:
+            self._sidecar.close()
+            self._sidecar = None
+        if self.spool is not None:
+            self.spool.close()
+            self.spool = None
+        if self._store is not None:
+            self._store.close()
 
     async def _connect(self) -> None:
         self.ui.info(N_("connecting ({transport})..."), transport=self.transport.name)
@@ -301,9 +472,17 @@ class Session:
     # ---- audio / polling ------------------------------------------------------------------------
 
     def _on_audio(self, samples: np.ndarray) -> None:
-        self.audio.push(samples)
         if self._recorder is not None:
             self._recorder.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+            self._sidecar.note(self._recorded, self.radio.state.frequency)
+            self._recorded += len(samples)
+        if self.playback is None:  # a recording being played replaces the radio audio
+            self._process_audio(samples)
+
+    def _process_audio(self, samples: np.ndarray) -> None:
+        self.audio.push(samples)
+        if self.spool is not None:
+            self.spool.write(samples, self.dial_frequency)
         if self.skimmer is not None and not self.transmitting:
             self.skimmer.process(samples)
             return
@@ -318,6 +497,8 @@ class Session:
                 continue
             tick += 1
             self._flush_rx_log()
+            if tick % 4 == 0:
+                self.book.tick()  # transmissions that ended in silence get their summary
             try:
                 self.radio.state.smeter = await self.radio.read_smeter()
                 if tick % 4 == 0:
@@ -325,10 +506,11 @@ class Session:
                     if freq != self.radio.state.frequency:
                         self._flush_rx_log(force=True)
                         log.info("frequency changed on the radio: %d Hz", freq)
+                        old = self.radio.state.frequency
                         self.radio.state.frequency = freq
                         self.decoder.reset()
-                        if self.skimmer is not None:
-                            self.skimmer.reset()
+                        if self.skimmer is not None and old is not None:
+                            self.skimmer.shift(self.scanner.sideband_sign * (freq - old))
                 if tick % 8 == 0:
                     self.radio.state.mode = await self.radio.read_mode()
             except (CivError, TransportError) as exc:
@@ -346,6 +528,7 @@ class Session:
             self.transmitting = True
             self.ui.status_changed()
             self.ui.tx_text(text)
+            self.book.tuned_tx(self.dial_frequency, text)
             self._tx_current = asyncio.create_task(self.radio.send_cw(text))
             try:
                 await self._tx_current
@@ -407,6 +590,9 @@ class Session:
             return
         if self.skimmer is not None:
             self.ui.error(N_("leave the skimmer first (/skim or F10)"))
+            return
+        if self.playback is not None:
+            self.ui.error(N_("a recording is playing: searching needs the radio (/play stop)"))
             return
         current = self.radio.state.frequency or 0
         if band is None:
@@ -470,8 +656,12 @@ class Session:
     async def _tune(self, freq: int) -> None:
         if not 30_000 <= freq <= 470_000_000:
             raise ValueError
-        if self.skimmer is not None:
-            self.skimmer.reset()
+        if self.skimmer is not None and self.playback is None:
+            old = self.radio.state.frequency
+            if old is not None:
+                self.skimmer.shift(self.scanner.sideband_sign * (freq - old))
+        if self.playback is not None:
+            self.ui.info(N_("the radio was tuned, but the audio still comes from the recording"))
         self._flush_rx_log(force=True)
         log.info("tune %d Hz", freq)
         await self.radio.set_frequency(freq)
@@ -580,6 +770,76 @@ class Session:
             await self.start_skim()
         elif self.skimmer is not None and (not args or args[0] == "off"):
             await self.stop_skim()
+
+    async def _cmd_play(self, args: list[str]) -> None:
+        """/play FILE [MHz] [xSPEED] · /play stop"""
+        if not args:
+            raise ValueError
+        if args[0].lower() == "stop":
+            self.stop_playback()
+            return
+        path = Path(args[0]).expanduser()
+        frequency, speed = None, 1.0
+        for arg in args[1:]:
+            if arg.lower().startswith("x"):
+                speed = max(0.25, min(20.0, float(arg[1:])))
+            else:
+                frequency = bands.parse_frequency(arg)
+        await self.start_playback(path, frequency, speed)
+
+    async def start_playback(self, path: Path, frequency: int | None = None,
+                             speed: float = 1.0) -> None:
+        self.stop_playback(quiet=True)
+        try:
+            playback = WavPlayback(path, self.transport.sample_rate, self._process_audio,
+                                   speed=speed, frequency=frequency)
+        except (OSError, ValueError, EOFError) as exc:
+            self.ui.error(N_("cannot play {file}: {error}"), file=str(path), error=str(exc))
+            return
+        self.playback = playback
+        self.decoder.reset(self.radio.state.pitch)
+        if self.skimmer is not None:
+            self.skimmer.reset()
+        self._playback_task = asyncio.create_task(self._play(playback))
+        known = bands.format_frequency(playback.frequency) if playback.timeline else "?"
+        self.ui.info(N_("playing {file} ({minutes} min, recorded on {freq} MHz)"),
+                     file=path.name, minutes=f"{playback.duration / 60:.1f}", freq=known)
+        self.ui.status_changed()
+
+    async def _play(self, playback: WavPlayback) -> None:
+        await playback.run()
+        if self.playback is playback:
+            self.playback = None
+            self.decoder.reset(self.radio.state.pitch)
+            if self.skimmer is not None:
+                self.skimmer.reset()
+            self.ui.info(N_("end of the recording; back to the radio audio"))
+            self.ui.status_changed()
+
+    def stop_playback(self, quiet: bool = False) -> None:
+        if self._playback_task is not None:
+            self._playback_task.cancel()
+            self._playback_task = None
+        if self.playback is not None:
+            self.playback = None
+            self.decoder.reset(self.radio.state.pitch)
+            if self.skimmer is not None:
+                self.skimmer.reset()
+            if not quiet:
+                self.ui.info(N_("playback stopped; back to the radio audio"))
+            self.ui.status_changed()
+
+    async def _cmd_channels(self, args: list[str]) -> None:
+        listing = self.list_channels()
+        for c in listing["session"]:
+            s = c["stats"]
+            self.ui.info(N_("{text}"), text=(
+                f"{'*' if c['unsaved'] else ' '}{c['id']:3d} {c['label']:14s} "
+                f"{bands.format_frequency(c['frequency'])}  {s['words']:4d} w  "
+                f"{s['recognized_pct']:5.1f}% ok  {s['noise_pct']:5.1f}% noise"))
+        if listing["saved"]:
+            self.ui.info(N_("archived channels: {names}"),
+                         names=", ".join(c["name"] for c in listing["saved"][:20]))
 
     async def _cmd_go(self, args: list[str]) -> None:
         await self.go_to_channel(int(args[0]) - 1)

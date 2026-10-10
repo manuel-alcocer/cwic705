@@ -5,7 +5,19 @@ radio's built-in network server (the protocol used by RS-BA1/wfview). USB connec
 for the next version.
 
 * Connects to the radio, tunes band and frequency, sets CW mode.
-* Decodes CW from the receive audio (adaptive speed 5–60 wpm, AFC, squelch).
+* Decodes CW from the receive audio with a **probabilistic (Bayesian) decoder**: timing
+  likelihoods tolerant of a human fist plus a CW language model (abbreviations, Q codes,
+  reports, MASTER.SCP callsigns). The classic threshold decoder remains available.
+* **Translation** of each transmission into plain language (who calls whom, report, name,
+  location, goodbye...), with callsign countries and a glossary of CW abbreviations.
+* **Channels**: every tuned conversation and every validated skimmer station becomes a channel
+  with its transcript, plain-language summaries and statistics (words, recognised %, noise %,
+  unreadable characters, callsigns, speed, SNR). F11 lists them; on exit the client offers to
+  archive them. Archive: SQLite by default or PostgreSQL (`[channels] database = "postgresql+
+  psycopg://..."`, `pip install cwic705[postgres]`), with optional lossless FLAC audio whose
+  metadata carries frequency, callsign and start time (`/play` reads them).
+* **Recordings**: `--record` saves audio plus a `.json` with the dial frequency; `/play file`
+  or `--wav file` decodes a recording exactly as if it came from the radio.
 * **Skimmer** (`/skim`, F10): opens the filter to 3.6 kHz, finds every keyed signal and decodes
   them all at once, listing stations by validated callsign (repeated, or known in MASTER.SCP).
 * Automatic search (`/scan`) through a band's CW segment; centres the first signal found.
@@ -78,8 +90,24 @@ A server reachable from the network refuses to start without a token. Logs:
 | `/wpm 22` · `/pitch 600` · `/power 50` · `/filter 500` | radio settings |
 | `/afc on\|off` · `/rxwpm 25` | decoder settings |
 | `/call EA4XXX` · `/macros` · `/macro F2` · F2–F9 | macros |
+| `/play file.wav [MHz] [x4]` · `/play stop` | decode a recording as if it came from the radio |
+| F11 · `/channels` | channels of the session and the archive (save, tune, play) |
 | `/raw 03` | raw CI-V command (debugging) |
 | `/help` · `/clear` · `/quit` | |
+
+## Decoder benchmark
+
+`python -m cwic705.bench` decodes synthetic QSOs with known text (human fist, fading, static
+crashes, SNR sweep) and prints the character error rate of each decoder. On a typical run:
+
+| SNR (500 Hz) | classic | bayes |
+|---|---|---|
+| 20 dB | 7 % | 2–3 % |
+| 8 dB | 12 % | 5 % |
+| 3 dB | 37 % | 27–30 % |
+
+`cwic705-replay file.wav [--skim]` runs a recording through the decoder or the skimmer.
+Choose the decoder with `[decoder] engine = "bayes" | "classic"`.
 
 ## Translations
 
@@ -96,6 +124,10 @@ src/cwic705/
   transport/lan.py   Icom network protocol      transport/sim.py  simulated IC-705
   radio.py           CI-V commands              decoder.py  CW decoder + signal detector
   skimmer.py         multi-signal skimmer       scanner.py  automatic search
+  bayes.py           probabilistic decoder      bench.py    decoder benchmark
+  interpret.py       plain-language translation hamdata.py  countries, Q codes (from HAMRLOG)
+  playback.py        WAV/FLAC playback          channels.py channels, statistics, archive
+  screens.py         dialogs, channels view
   tui.py styles.tcss Textual client (HAMRLOG look)   plain.py  line client
   i18n.py locales/   translations
 ```

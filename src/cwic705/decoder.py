@@ -122,6 +122,10 @@ class CwDecoder:
         self._elements = ""
         self._word_done = True
         self._squelch_open = False
+        self._key = False
+        self._level_sum, self._level_n = 0.0, 0
+        self._mark_levels: deque[float] = deque(maxlen=8)
+        self.signal = 1e-6
         self._afc_buf[:] = 0
         self._afc_count = 0
 
@@ -147,13 +151,27 @@ class CwDecoder:
             self._squelch_open = True
         elif ratio < SQUELCH_CLOSE:
             self._squelch_open = False
-        span = self.peak - self.noise
+        # Signal level: the median level of the last real pulses follows fading (QSB) pulse
+        # by pulse, where a percentile over seconds would still remember the strong part.
+        self.signal = self.peak
+        if len(self._mark_levels) >= 3:
+            self.signal = min(self.peak, float(np.median(self._mark_levels)))
+        span = max(self.signal - self.noise, 1e-9)
         hi = self.noise + 0.55 * span
         lo = self.noise + 0.40 * span
         squelched = self.squelched or self.muted
         for m in mags:
             self.level = m
-            self._step(not squelched and (m > (lo if self._down else hi)))
+            key = not squelched and (m > (lo if self._key else hi))
+            if key:
+                self._level_sum += m
+                self._level_n += 1
+            elif self._key:
+                if self._level_n / HOP_RATE >= 0.6 * self.dit:
+                    self._mark_levels.append(self._level_sum / self._level_n)
+                self._level_sum, self._level_n = 0.0, 0
+            self._key = key
+            self._step(key)
         self._adapt_window()
 
     def _adapt_window(self) -> None:

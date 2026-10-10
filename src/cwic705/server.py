@@ -78,6 +78,9 @@ class CoreServer:
                 if msg.get("type") == "command" and isinstance(msg.get("line"), str):
                     log.info("client %s: %s", peer, msg["line"])
                     await self.core.command(msg["line"])
+                elif msg.get("type") == "call" and isinstance(msg.get("method"), str):
+                    result = await self.core.call(msg["method"], msg.get("params") or {})
+                    push({"type": "reply", "id": msg.get("id"), "result": result})
         except ConnectionClosed:
             pass
         finally:

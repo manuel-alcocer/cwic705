@@ -94,3 +94,20 @@ def test_skimmer_finds_each_station_and_validates_callsigns():
         sk.process(x[i:i + 160])
     assert sorted(round(ch.tone / 10) * 10 for ch in sk.channels) == [700, 1150, 1700]
     assert {call for _, call in spots} == {"EA1AAA", "DL2BBB", "G4DDD"}
+
+
+def test_bayesian_decoder_beats_classic_on_human_keying():
+    from cwic705 import bench
+    from cwic705.bayes import BayesDecoder
+
+    rng = np.random.default_rng(3)
+    classic, bayes = [], []
+    for _ in range(8):
+        text, audio = bench.make_case(rng, bench.FALLBACK_CALLS, 8.0, float(rng.uniform(16, 30)),
+                                      jitter=0.15, fading=0.5, crashes=0.5)
+        classic.append(bench.cer(text, bench.run_decoder(
+            lambda cb: CwDecoder(FS, 600, on_text=cb), audio)))
+        bayes.append(bench.cer(text, bench.run_decoder(
+            lambda cb: BayesDecoder(FS, 600, on_text=cb), audio)))
+    assert np.mean(bayes) < 0.10
+    assert np.mean(bayes) < np.mean(classic)

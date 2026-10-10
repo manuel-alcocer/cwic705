@@ -8,6 +8,9 @@ Events (server -> client), by "type":
   welcome  {version, radio, tx_enabled, callsign, macros}   first message of a session
   state    {...}  radio/decoder/flags snapshot, see snapshot()          (4 per second)
   skim     {channels: [{index, frequency, tone, callsign, wpm, snr_db, text}]}  (1 per s)
+  channels {session: [{id, label, frequency, callsign, unsaved, stats...}]}  on change (2 s)
+  history  {title, text}  earlier text of a station picked from the skimmer
+  reply    {id, result}   answer to a call
   rx       {text}  decoded characters (single decoder mode)
   tx       {text}  text handed to the radio keyer
   info     {msgid, args, text}  / error {msgid, args, text}  messages for the operator:
@@ -16,6 +19,8 @@ Events (server -> client), by "type":
 Commands (client -> server):
   hello    {token, client}   must be first on a remote connection
   command  {line}
+  call     {id, method, params}  methods: channels, transcript {id, saved},
+           save_channel {id, name, auto, append, audio}; answered with a reply event
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ PROTOCOL_VERSION = 1
 DEFAULT_PORT = 7373
 STATE_INTERVAL = 0.25
 SKIM_INTERVAL = 1.0
+CHANNELS_INTERVAL = 2.0
 BACKLOG = 400          # text events replayed to a client that connects later
 RETRY_DELAY = 10.0     # server mode: wait between attempts to reach the radio
 
@@ -92,6 +98,9 @@ class EventHub:
     def status_changed(self) -> None:
         pass  # state is pushed at a fixed rate by Core
 
+    def history(self, title: str, text: str) -> None:
+        self.emit({"type": "history", "title": title, "text": text}, keep=True)
+
 
 def snapshot(session: Session) -> Event:
     st, d = session.radio.state, session.decoder
@@ -100,7 +109,7 @@ def snapshot(session: Session) -> Event:
         "connected": session.connected,
         "transport": session.transport.name,
         "radio": session.transport.radio_name,
-        "frequency": st.frequency,
+        "frequency": session.dial_frequency,
         "mode": st.mode,
         "smeter": st.smeter,
         "pitch": st.pitch,
@@ -113,6 +122,11 @@ def snapshot(session: Session) -> Event:
         "skimming": session.skimmer is not None,
         "skim_range": session.skim_range(),
         "spots": session.spots,
+        "playback": None if session.playback is None else {
+            "file": session.playback.path.name,
+            "elapsed": round(session.playback.elapsed, 1),
+            "duration": round(session.playback.duration, 1),
+        },
         "decoder": {
             "tone": round(d.tone, 1),
             "wpm": round(d.wpm, 1),
@@ -173,10 +187,28 @@ class Core:
                 await asyncio.sleep(RETRY_DELAY)
         self._ticker = asyncio.create_task(self._tick())
 
-    async def stop(self) -> None:
+    async def stop(self, autosave: bool = False) -> None:
         if self._ticker is not None:
             self._ticker.cancel()
+        if autosave:
+            saved = self.session.autosave()
+            if saved:
+                log.info("archived %d unsaved channels on exit", saved)
         await self.session.stop()
+
+    async def call(self, method: str, params: dict | None = None) -> dict:
+        params = params or {}
+        session = self.session
+        if method == "channels":
+            return session.list_channels()
+        if method == "transcript":
+            return {"transcript": session.channel_transcript(int(params["id"]),
+                                                              bool(params.get("saved")))}
+        if method == "save_channel":
+            return session.save_channel(int(params["id"]), params.get("name"),
+                                        bool(params.get("auto")), bool(params.get("append")),
+                                        bool(params.get("audio")))
+        return {"error": f"unknown method {method}"}
 
     async def command(self, line: str) -> None:
         if line.strip().lower() in ("/quit", "/q", "/exit"):
@@ -184,12 +216,15 @@ class Core:
         await self.session.execute(line)
 
     async def _tick(self) -> None:
-        last_skim = 0.0
+        last_skim = last_channels = 0.0
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(STATE_INTERVAL)
             with contextlib.suppress(Exception):
                 self.hub.emit(snapshot(self.session))
+                if loop.time() - last_channels >= CHANNELS_INTERVAL:
+                    last_channels = loop.time()
+                    self.hub.emit({"type": "channels", "session": self.session.book.summaries()})
                 if self.session.skimmer is not None and loop.time() - last_skim >= SKIM_INTERVAL:
                     last_skim = loop.time()
                     self.hub.emit(skim_table(self.session))
